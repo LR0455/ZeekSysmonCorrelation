@@ -6,22 +6,19 @@ from datetime import datetime
 import pandas as pd
 import time
 import threading
+from progressbar import *
+from functools import *
 
 class ZeekSysmon:
     def __init__(self, sysmon_raw_data, zeek_raw_data):
-        sysmon_thread = threading.Thread(target=self._sysmonInit, args=(sysmon_raw_data, ))
-        zeek_thread = threading.Thread(target=self._zeekInit, args=(zeek_raw_data, ))
 
-        sysmon_thread.start()
-        zeek_thread.start()
-
-        sysmon_thread.join()
-        zeek_thread.join()
+        self._sysmonInit(sysmon_raw_data)
+        self._zeekInit(zeek_raw_data)
         
     
     def _sysmonInit(self, sysmon_raw_data):
         # sysmon initial
-        self.sysmon_raw_data = pd.json_normalize(sysmon_raw_data)
+        self.sysmon_raw_data = sysmon_raw_data
         self.sysmon_raw_data = self.sysmon_raw_data.fillna('')
 
         # get same prefix columns
@@ -37,7 +34,7 @@ class ZeekSysmon:
         # zeek initial
         self.zeek_raw_data = zeek_raw_data
         self.zeek = self.zeek(self)
-        self.correlated_zeek_data = self.zeek.correlateUid()
+        self.correlated_zeek_data = zeek_raw_data.fillna('')
 
     class sysmon:
         def __init__(self, super_self):
@@ -82,7 +79,7 @@ class ZeekSysmon:
         
         def getMinMaxTime(self, related_guid):
             #print("sysmon min max time getting ...")
-            min_time = 1e9
+            min_time = 1e15
             max_time = 0
 
             for guid in related_guid:
@@ -90,7 +87,6 @@ class ZeekSysmon:
                     min_time = min(min_time, self.super.min_time_by_guid[guid])
                 if guid in self.super.max_time_by_guid:
                     max_time = max(max_time, self.super.max_time_by_guid[guid])
-            
             return min_time, max_time
 
     class zeek:
@@ -112,11 +108,8 @@ class ZeekSysmon:
             
         def getRelatedLogs(self, conditions, start_time, end_time):
             #print("zeek related uid getting ...")
-            related_zeek_data = self.super.correlated_zeek_data[self.super.correlated_zeek_data['conn.ts'].between(start_time, end_time)]
-            query = ' and '.join(map(lambda cond: f'`{cond[0]}` == "{cond[1]}"', conditions.items()))
-            related_zeek_data = related_zeek_data.query(query)
-            
-            return related_zeek_data
+            related_zeek_data = self.super.correlated_zeek_data[self.super.correlated_zeek_data['conn.ts'].between(start_time - 60, end_time + 60)]
+            return reduce(lambda df, conn: df[df[conn[0]] == conn[1]], conditions.items(), related_zeek_data) 
 
     def utcTosec(self, utc):
         return calendar.timegm(time.strptime(utc, '%Y-%m-%d %H:%M:%S.%f'))
@@ -131,6 +124,12 @@ class ZeekSysmon:
         # improve speed
         self.corr_data = [pd.DataFrame()] * (len(self.sysmon_network_data)+1)
         thread = []
+
+        self.total = len(self.sysmon_network_data)
+        self.count = 0
+        self.pbar = ProgressBar().start()
+        self.lock = threading.Lock()
+
         for idx, log in self.sysmon_network_data.iterrows():
             t = threading.Thread(target=self._correlate, args=(log, group_id, ))
             group_id += 1
@@ -139,11 +138,15 @@ class ZeekSysmon:
         
         for t in thread:
             t.join()    
-        
+
+        self.pbar.finish()
+        print('correlated data concating...')
+
         self.correlated_data = pd.concat(self.corr_data)
         self.correlated_data = self.correlated_data.reset_index()
         self.correlated_data = self.correlated_data.fillna('')
         
+        print('zeek and sysmon correlate finish...')
         print(self.correlated_data)
         
         return self.correlated_data
@@ -151,10 +154,10 @@ class ZeekSysmon:
 
     def _correlate(self, network_log, group_id = 0):
         
-        src_ip, src_port = network_log['winlog.event_data.SourceIp'], network_log['winlog.event_data.SourcePort']
-        dst_ip, dst_port = network_log['winlog.event_data.DestinationIp'], network_log['winlog.event_data.DestinationPort']
+        src_ip, src_port = network_log['winlog.event_data.SourceIp'], int(network_log['winlog.event_data.SourcePort'])
+        dst_ip, dst_port = network_log['winlog.event_data.DestinationIp'], int(network_log['winlog.event_data.DestinationPort'])
         protocol = network_log['winlog.event_data.Protocol']
-
+        
         process_guid = network_log['winlog.event_data.ProcessGuid']
         related_guid = self.sysmon.getRelatedGuid(process_guid)
         min_time, max_time = self.sysmon.getMinMaxTime(related_guid)
@@ -171,5 +174,11 @@ class ZeekSysmon:
             
             self.corr_data[group_id] = related_sysmon_data
             self.corr_data[group_id] = self.corr_data[group_id].append(related_zeek_data)
+
+        # calculate progressbar
+        self.lock.acquire()
+        self.count += 1
+        self.pbar.update(int((self.count / self.total) * 100))
+        self.lock.release()
         
         

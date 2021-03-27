@@ -1,12 +1,10 @@
-import json
 import calendar, time
 
 from icecream import ic
 from zeek_sysmon import *
 from data import *
 from icecream import ic
-from elk import *
-import config
+
 import warnings  
 warnings.filterwarnings("ignore") 
 
@@ -17,15 +15,16 @@ import pandas as pd
 def queryLogsbyELK():
     data = Data()
 
-    start_time = '2021-03-01' + 'T16:00:00.000' + '+08:00'
-    end_time = '2021-03-01' + 'T16:10:00.000' + '+08:00'
+    start_time = '2021-03-15' + 'T16:00:00.000' + '+08:00'
+    end_time = '2021-03-15' + 'T16:05:00.000' + '+08:00'
 
     # query sysmon data
-    sysmon_data = data.elk.query('*weitung.winlog_sysmon*', start_time, end_time, [], ['winlog'])
+    #sysmon_data = data.elk.query('*weitung.winlog_sysmon*', start_time, end_time, [], ['winlog'])
+    sysmon_data = data.elk.query('*win10_1511*', start_time, end_time, [], ['winlog'])
     
     # query zeek data
-    zeek_conn_data = data.elk.query('logstash-sdn.zeek-conn*', start_time, end_time, [{'message':'192.168.1.133'}], [])
-    zeek_dns_data = data.elk.query('logstash-sdn.zeek-dns*', start_time, end_time, [{'message':'192.168.1.133'}], [])
+    zeek_conn_data = data.elk.query('logstash-sdn.zeek-conn*', start_time, end_time, [{'message':'192.168.1.117'}], [])
+    zeek_dns_data = data.elk.query('logstash-sdn.zeek-dns*', start_time, end_time, [{'message':'192.168.1.117'}], [])
     # zeek_http_data = data.elk.query('logstash-sdn.zeek-http*', start_time, end_time, [], [])
 
     zeek_data = {'conn': zeek_conn_data, 'dns': zeek_dns_data}
@@ -59,6 +58,28 @@ def queryLogsbyAPT29():
     
     return sysmon_data, zeek_data
 
+def preprocess(data, log_type):
+    print(log_type, 'preprocessing...')
+    if log_type == 'sysmon':
+        return pd.json_normalize(data)
+
+    if log_type == 'zeek':
+        zeek_data = pd.DataFrame()
+
+        for zeek_type in data:
+            logs = pd.json_normalize(data[zeek_type])               
+            logs['ts'] = pd.to_numeric(logs['ts'], errors='coerce') # change ts type
+            logs = logs.rename(lambda x: f'{zeek_type}.{x}' if not x in ['uid'] else x, axis='columns')   
+            zeek_data = logs if 'uid' not in zeek_data.columns else zeek_data.merge(logs, on='uid', how='outer')
+        
+        zeek_data['conn.ts'] = zeek_data['conn.ts'].fillna(0)
+        return zeek_data
+
+def convert(x):
+    try:
+        return x.astype(int)
+    except:
+        return x
 
 def main():
     start_time = time.time()
@@ -69,23 +90,19 @@ def main():
         elif args.dataset == 'apt29':
             sysmon_data, zeek_data = queryLogsbyAPT29()
         
-        sysmon_data, zeek_data = pd.DataFrame(sysmon_data), pd.DataFrame.from_dict([zeek_data])
+        sysmon_data, zeek_data = preprocess(sysmon_data, 'sysmon'), preprocess(zeek_data, 'zeek')
         sysmon_data.to_csv('./query_data/sysmon.csv', index=False)
         zeek_data.to_csv('./query_data/zeek.csv', index=False)
         
         print('querying finished')
         
     if args.action == 'correlate': 
-        sysmon_data = pd.read_csv('./query_data/sysmon.csv', low_memory=True)
-        zeek_data = pd.read_csv('./query_data/zeek.csv', low_memory=True)
-        sysmon_data = sysmon_data['winlog'].tolist()
-        sysmon_data = list(map(lambda x: {'winlog': eval(x)}, sysmon_data))
-
-        zeek_data = {'conn': eval(zeek_data['conn'].iloc[0]), 'dns': eval(zeek_data['dns'].iloc[0])}
-        
+        sysmon_data = pd.read_csv('./query_data/sysmon.csv', low_memory=True).apply(convert)
+        zeek_data = pd.read_csv('./query_data/zeek.csv', low_memory=True).apply(convert)
         zs = ZeekSysmon(sysmon_data, zeek_data)
         zeek_sysmon_data = zs.correlate()
-        zeek_sysmon_data.to_csv('./correlated_data/elk.csv')
+        print('csv saving...')
+        # zeek_sysmon_data.to_csv('./correlated_data/elk.csv')
 
     print(time.time() - start_time)
 
